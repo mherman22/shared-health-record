@@ -128,7 +128,7 @@ describe('MPI Resolution on Write Path', () => {
 
     // Verify the CR was queried
     expect(getSpy).toHaveBeenCalled()
-    const crCallUrl = getSpy.mock.calls[0][0] as string
+    const crCallUrl = String(getSpy.mock.calls[0][0])
     expect(crCallUrl).toContain('CR/fhir/Patient?identifier=')
 
     // Verify the patient sent to HAPI FHIR has the golden record link
