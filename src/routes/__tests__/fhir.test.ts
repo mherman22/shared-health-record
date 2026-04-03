@@ -53,7 +53,7 @@ it('should return 500 Internal Server Error when the post request fails', async 
 
   await saveResource(req, res)
 
-  expect(res.status).toHaveBeenCalledWith(400)
+  expect(res.status).toHaveBeenCalledWith(500)
 })
 
 describe('MPI Resolution on Write Path', () => {
