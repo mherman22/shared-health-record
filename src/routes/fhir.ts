@@ -11,11 +11,16 @@ import { getMetadata } from '../lib/helpers'
 
 export const router = express.Router()
 
-const GOLDEN_RECORD_CODE = '5c827da5-4858-4f3d-a50c-62ece001efea'
+const GOLDEN_RECORD_CODE = config.get('goldenRecordCode') || '5c827da5-4858-4f3d-a50c-62ece001efea'
 
 // Timeout for MPI lookups — prevents slow CR from stalling SHR writes.
-// Falls back to 5 seconds if not configured.
-const MPI_LOOKUP_TIMEOUT_MS = config.get('mpiLookupTimeoutMs') || 5000
+// Falls back to 5 seconds if not configured or invalid.
+const rawMpiLookupTimeoutMs = config.get('mpiLookupTimeoutMs')
+const parsedMpiLookupTimeoutMs = Number(rawMpiLookupTimeoutMs)
+const MPI_LOOKUP_TIMEOUT_MS =
+  rawMpiLookupTimeoutMs === undefined || rawMpiLookupTimeoutMs === null || Number.isNaN(parsedMpiLookupTimeoutMs)
+    ? 5000
+    : parsedMpiLookupTimeoutMs
 
 /**
  * Look up a Patient's golden record (master patient ID) in the Client Registry.
@@ -31,7 +36,7 @@ async function resolvePatientMpi(patient: any): Promise<any> {
     return patient
   }
 
-  const identifiers = patient.identifier || []
+  const identifiers = patient.identifier ? (Array.isArray(patient.identifier) ? patient.identifier  :  [patient.identifier]): []
   let goldenRecordId: string | null = null
 
   const options = {
