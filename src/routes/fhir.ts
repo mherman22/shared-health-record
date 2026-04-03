@@ -97,15 +97,18 @@ async function resolvePatientMpi(patient: any): Promise<any> {
 /**
  * Enrich a FHIR Bundle by resolving Patient resources against the MPI.
  * Non-Patient resources are passed through unchanged.
+ * Patient lookups run in parallel to minimize write-path latency.
  */
 async function enrichBundleWithMpi(bundle: any): Promise<any> {
   if (!bundle || !bundle.entry) return bundle
 
-  for (const entry of bundle.entry) {
+  const resolutions = bundle.entry.map(async (entry: any) => {
     if (entry.resource && entry.resource.resourceType === 'Patient') {
       entry.resource = await resolvePatientMpi(entry.resource)
     }
-  }
+  })
+
+  await Promise.allSettled(resolutions)
 
   return bundle
 }
