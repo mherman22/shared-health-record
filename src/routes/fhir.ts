@@ -11,6 +11,132 @@ import { getMetadata } from '../lib/helpers'
 
 export const router = express.Router()
 
+const GOLDEN_RECORD_CODE = config.get('goldenRecordCode') || '5c827da5-4858-4f3d-a50c-62ece001efea'
+
+// Timeout for MPI lookups — prevents slow CR from stalling SHR writes.
+// Falls back to 5 seconds if not configured or invalid.
+const rawMpiLookupTimeoutMs = config.get('mpiLookupTimeoutMs')
+const parsedMpiLookupTimeoutMs = Number(rawMpiLookupTimeoutMs)
+const MPI_LOOKUP_TIMEOUT_MS =
+  rawMpiLookupTimeoutMs === undefined || rawMpiLookupTimeoutMs === null || Number.isNaN(parsedMpiLookupTimeoutMs)
+    ? 5000
+    : parsedMpiLookupTimeoutMs
+
+/**
+ * Look up a Patient's golden record (master patient ID) in the Client Registry.
+ * If found, adds a Patient.link entry pointing to the golden record.
+ * This ensures the SHR stores patients with their MPI identifier,
+ * enabling cross-facility longitudinal queries.
+ *
+ * Returns the enriched patient resource, or the original if no CR match found.
+ */
+async function resolvePatientMpi(patient: any): Promise<any> {
+  const crUrl = config.get('clientRegistryUrl')
+  if (!crUrl || !patient || patient.resourceType !== 'Patient') {
+    return patient
+  }
+
+  const identifiers = patient.identifier ? (Array.isArray(patient.identifier) ? patient.identifier  :  [patient.identifier]): []
+  let goldenRecordId: string | null = null
+
+  const options = {
+    username: config.get('clientRegistryUsername') || config.get('fhirServer:username'),
+    password: config.get('clientRegistryPassword') || config.get('fhirServer:password'),
+    timeout: { request: MPI_LOOKUP_TIMEOUT_MS },
+    retry: { limit: 1, methods: ['GET' as const] },
+  }
+
+  for (const identifier of identifiers) {
+    if (!identifier.system || !identifier.value) continue
+
+    const idValue = String(identifier.value)
+    const maskedValue = idValue.slice(0, 3) + '***'
+
+    try {
+      const searchUrl = `${crUrl}/Patient?identifier=${encodeURIComponent(identifier.system)}|${encodeURIComponent(idValue)}&_include=Patient:link`
+      logger.debug(`MPI lookup: ${identifier.system}|${maskedValue}`)
+
+      const response: any = await got.get(searchUrl, options).json()
+
+      if (response && response.entry) {
+        for (const entry of response.entry) {
+          const resource = entry.resource
+          if (
+            resource &&
+            resource.meta &&
+            resource.meta.tag &&
+            resource.meta.tag.some((t: any) => t.code === GOLDEN_RECORD_CODE)
+          ) {
+            goldenRecordId = resource.id
+            break
+          }
+        }
+      }
+
+      if (goldenRecordId) break // Found a match, stop searching
+    } catch (error: any) {
+      // Log and continue to the next identifier
+      logger.warn(`MPI lookup failed for identifier ${identifier.system}|${maskedValue}: ${error.message}`)
+    }
+  }
+
+  if (goldenRecordId) {
+    logger.info(`MPI resolved: Patient/${patient.id} → golden record ${goldenRecordId}`)
+
+    if (!patient.link) patient.link = []
+
+    const alreadyLinked = patient.link.some(
+      (l: any) => l.other && l.other.reference === `Patient/${goldenRecordId}`,
+    )
+
+    if (!alreadyLinked) {
+      patient.link.push({
+        other: { reference: `Patient/${goldenRecordId}` },
+        type: 'refer',
+      })
+    }
+  } else {
+    logger.info(`MPI lookup: no golden record found for Patient/${patient.id}`)
+  }
+
+  return patient
+}
+
+/**
+ * Enrich a FHIR Bundle by resolving Patient resources against the MPI.
+ * Non-Patient resources are passed through unchanged.
+ * Processes patients in batches of MPI_CONCURRENCY to avoid overwhelming the CR.
+ */
+const MPI_CONCURRENCY = 5
+
+async function enrichBundleWithMpi(bundle: any): Promise<any> {
+  if (!bundle || !bundle.entry) return bundle
+
+  const patientEntries = bundle.entry.filter(
+    (e: any) => e.resource && e.resource.resourceType === 'Patient',
+  )
+
+  if (patientEntries.length === 0) return bundle
+
+  // Process in batches to limit concurrent CR requests
+  for (let i = 0; i < patientEntries.length; i += MPI_CONCURRENCY) {
+    const batch = patientEntries.slice(i, i + MPI_CONCURRENCY)
+    await Promise.all(
+      batch.map((entry: any) =>
+        resolvePatientMpi(entry.resource)
+          .then((resolved: any) => {
+            entry.resource = resolved
+          })
+          .catch((err: any) => {
+            logger.warn(`MPI enrichment failed for Patient/${entry.resource.id}: ${err.message}`)
+          }),
+      ),
+    )
+  }
+
+  return bundle
+}
+
 router.get('/', (req: Request, res: Response) => {
   return res.status(200).send(req.url)
 })
@@ -93,11 +219,11 @@ router.get('/:resource/:id?/:operation?', async (req: Request, res: Response) =>
   }
 })
 
-// Post a bundle of resources
+// Post a bundle of resources — enriched with MPI golden record links
 router.post('/', async (req, res) => {
   try {
     logger.info('Received a request to add a bundle of resources')
-    const resource = req.body
+    let resource = req.body
 
     // Verify the bundle
     if (invalidBundle(resource)) {
@@ -108,6 +234,9 @@ router.post('/', async (req, res) => {
       logger.info('Received empty bundle, returning empty response')
       return res.status(200).json(emptyBundleResponse())
     }
+
+    // Resolve Patient resources against the MPI before saving
+    resource = await enrichBundleWithMpi(resource)
 
     const uri = URI(config.get('fhirServer:baseURL'))
 
@@ -138,7 +267,7 @@ router.put('/:resourceType/:id', (req: any, res: any) => {
 /** Helpers */
 
 export async function saveResource(req: any, res: any, operation?: string) {
-  const resource = req.body
+  let resource = req.body
   const resourceType = req.params.resourceType
   const id = req.params.id
   if (id && !resource.id) {
@@ -146,7 +275,19 @@ export async function saveResource(req: any, res: any, operation?: string) {
   }
 
   logger.info('Received a request to add resource type ' + resourceType + ' with id ' + id)
-  
+
+  // Resolve Patient against MPI before saving, but do not block the save if MPI resolution fails.
+  if (resourceType === 'Patient') {
+    try {
+      resource = await resolvePatientMpi(resource)
+    } catch (error: any) {
+      logger.warn(
+        'Failed to resolve Patient against MPI during saveResource; continuing with original resource: ' +
+          (error?.message || String(error))
+      )
+    }
+  }
+
   let ret, uri, errorFromHapi
   try {
     if (req.method === 'POST') {
@@ -159,7 +300,7 @@ export async function saveResource(req: any, res: any, operation?: string) {
       return
     }
 
-    // Perform  request
+    // Perform request
     logger.info('Sending ' + req.method + ' request to ' + uri)
     ret = await got({
       method: req.method,
