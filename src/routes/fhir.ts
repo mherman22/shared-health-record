@@ -6,7 +6,7 @@ import config from '../lib/config'
 import { emptyBundle, emptyBundleResponse, getHapiPassthrough, invalidBundle, invalidBundleMessage } from '../lib/helpers'
 import logger from '../lib/winston'
 import { R4 } from '@ahryman40k/ts-fhir-types'
-import { generateCrossFacilityIpsBundle, generateSimpleIpsBundle } from '../workflows/ipsWorkflows'
+import { generateCrossFacilityIpsBundle } from '../workflows/ipsWorkflows'
 import { getResourceTypeEnum, isValidResourceType } from '../lib/validate'
 import { getMetadata } from '../lib/helpers'
 
@@ -483,14 +483,10 @@ router.get('/:resource/:id?/:operation?', async (req: Request, res: Response) =>
       // Handle IPS Generation.
 
       if (req.params.id && req.params.id.length > 0 && req.params.id[0] != '$') {
-        // Using logical id — resolve all linked patients via golden record for cross-facility IPS.
+        // Resolve all linked patients via golden record and generate IPS.
         const { patientIds: allPatientIds, goldenRecordId } = await resolveAllLinkedPatients(req.params.id)
-        if (allPatientIds.length > 1) {
-          logger.info(`IPS: Patient/${req.params.id} has ${allPatientIds.length} linked patients, generating cross-facility summary`)
-          result = await generateCrossFacilityIpsBundle(allPatientIds, goldenRecordId)
-        } else {
-          result = await generateSimpleIpsBundle(req.params.id)
-        }
+        logger.info(`IPS: Patient/${req.params.id} → ${allPatientIds.length} linked patient(s)`)
+        result = await generateCrossFacilityIpsBundle(allPatientIds, goldenRecordId)
       } else if (req.params.id == '$summary') {
         /**
          * If not using logical id, use the Client Registry to resolve patient identity:
